@@ -66,6 +66,16 @@ PARAMS=$(grep -m1 '^ExtraCommandLineParams=' "$CDEF") || die "no ExtraCommandLin
 mapfile -t INJECT < <(grep -oE '\-i=[A-Za-z0-9_.-]+\.dll' <<<"$PARAMS" | sort -u)
 [[ ${#INJECT[@]} -gt 0 ]] || die "could not parse -i list"
 
+# DROP="DoctrineExt.dll IntelExt.dll" removes DLLs from the injection list —
+# for bisecting which Ext DLL is responsible for a load crash. Both instances
+# get the same reduced list (they must stay identical to avoid a desync).
+if [[ -n "${DROP:-}" ]]; then
+    for d in $DROP; do
+        mapfile -t INJECT < <(printf '%s\n' "${INJECT[@]}" | grep -v "\-i=$d\$")
+    done
+    echo "DROP: removed [$DROP]; ${#INJECT[@]} DLLs remain"
+fi
+
 # Game flags: parse the wine-game.sh launch line (everything after the exe
 # name that starts with '-', minus any stray -i= tokens).
 WGS="$INSTALL_A/Resources/Compatibility/Unix/wine-game.sh"
