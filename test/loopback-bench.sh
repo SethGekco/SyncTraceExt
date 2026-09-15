@@ -43,7 +43,15 @@ die() { echo "error: $*" >&2; exit 1; }
 
 [[ -d "$INSTALL_A" ]] || die "install A missing: $INSTALL_A"
 [[ -d "$INSTALL_B" ]] || die "install B missing: $INSTALL_B (run CountryLimitExt/test/clone-install.sh)"
-[[ -f "$INSTALL_A/spawnmap.ini" ]] || die "no spawnmap.ini in A — host any game once (or copy a map) so a spawnmap exists. It needs >= $((AIPLAYERS+2)) start positions."
+
+# BENCHMAP=/path/to/8player.map installs that map as the bench spawnmap.
+if [[ -n "${BENCHMAP:-}" ]]; then
+    [[ -f "$BENCHMAP" ]] || die "BENCHMAP not found: $BENCHMAP"
+    cp -f "$BENCHMAP" "$INSTALL_A/spawnmap.ini"
+fi
+[[ -f "$INSTALL_A/spawnmap.ini" ]] || die "no spawnmap.ini in A — host any game once, or pass BENCHMAP=/path/to/map. It needs >= $((AIPLAYERS+2)) start positions."
+STARTS=$(sed -n '/^\[Waypoints\]/,/^\[/p' "$INSTALL_A/spawnmap.ini" | grep -cE '^[0-7]=')
+[[ "$STARTS" -ge $((AIPLAYERS+2)) ]] || die "spawnmap has $STARTS start positions, need $((AIPLAYERS+2)) (lower AIPLAYERS or pass a bigger BENCHMAP)"
 
 # --- sync B to A (map, rules, DLLs) ----------------------------------------
 cp -f "$INSTALL_A/spawnmap.ini" "$INSTALL_B/spawnmap.ini"
@@ -51,12 +59,22 @@ for f in rulesmd.ini artmd.ini aimd.ini; do
     [[ -f "$INSTALL_A/$f" ]] && cp -f "$INSTALL_A/$f" "$INSTALL_B/$f"
 done
 
+# DLL list: ClientDefinitions.ini is what CnCNet games actually inject.
+# (Since 2026-09 it holds ONLY the -i list; exe + game flags live elsewhere.)
 CDEF="$INSTALL_A/Resources/ClientDefinitions.ini"
 PARAMS=$(grep -m1 '^ExtraCommandLineParams=' "$CDEF") || die "no ExtraCommandLineParams in $CDEF"
 mapfile -t INJECT < <(grep -oE '\-i=[A-Za-z0-9_.-]+\.dll' <<<"$PARAMS" | sort -u)
 [[ ${#INJECT[@]} -gt 0 ]] || die "could not parse -i list"
-mapfile -t GAME_ARGS < <(sed 's/.*gamemd-spawn\.exe"\?//' <<<"$PARAMS" | tr -s ' ' '\n' | grep -E '^-')
+
+# Game flags: parse the wine-game.sh launch line (everything after the exe
+# name that starts with '-', minus any stray -i= tokens).
+WGS="$INSTALL_A/Resources/Compatibility/Unix/wine-game.sh"
+mapfile -t GAME_ARGS < <(grep -m1 'Syringe\.exe .*gamemd-spawn\.exe' "$WGS" 2>/dev/null \
+    | sed 's/.*gamemd-spawn\.exe"\{0,1\}//' | tr -s ' ' '\n' \
+    | grep -E '^-' | grep -v '^-i=')
 [[ ${#GAME_ARGS[@]} -gt 0 ]] || GAME_ARGS=(-SPAWN -LOG -CD)
+echo "game args: ${GAME_ARGS[*]}"
+case " ${GAME_ARGS[*]} " in *" -SPAWN "*) ;; *) GAME_ARGS=(-SPAWN "${GAME_ARGS[@]}");; esac
 
 for tok in "${INJECT[@]}"; do
     dll="${tok#-i=}"
@@ -128,10 +146,14 @@ trap cleanup EXIT
 # Instance A is launched THROUGH the sampler so the sampler is an ancestor of
 # the game process — required for ptrace under kernel.yama.ptrace_scope=1.
 LOG_A="$OUTDIR/launch-A.log"; LOG_B="$OUTDIR/launch-B.log"
+# The exe is passed as ' gamemd-spawn.exe' (leading space): wine re-quotes
+# argv elements containing spaces when building the Windows command line, and
+# Syringe REQUIRES the exe name quoted or it exits with "Invalid command line
+# arguments given" — the same load-bearing trick as wine-game.sh.
 LAUNCH_A="cd $(printf %q "$INSTALL_A") && WINEPREFIX=$(printf %q "$PREFIX_A")"
 LAUNCH_A+=" exec $(printf %q "$WINE") Syringe.exe"
 for t in "${INJECT[@]}"; do LAUNCH_A+=" $(printf %q "$t")"; done
-LAUNCH_A+=" gamemd-spawn.exe"
+LAUNCH_A+=" $(printf %q ' gamemd-spawn.exe')"
 for t in "${GAME_ARGS[@]}"; do LAUNCH_A+=" $(printf %q "$t")"; done
 
 echo "launching A (via sampler, warmup ${WARMUP}s, sample ${SAMPLE_SECONDS}s) ..."
@@ -141,20 +163,38 @@ SAMPLER=$!
 sleep 5
 echo "launching B ..."
 ( cd "$INSTALL_B" && WINEPREFIX="$PREFIX_B" "$WINE" Syringe.exe "${INJECT[@]}" \
-    gamemd-spawn.exe "${GAME_ARGS[@]}" ) >"$LOG_B" 2>&1 &
+    ' gamemd-spawn.exe' "${GAME_ARGS[@]}" ) >"$LOG_B" 2>&1 &
 
 T0=$(date +%s)
 sleep 12
-LIVE=$(pgrep -fc 'gamemd-spawn' || echo 0)
-[[ "$LIVE" -ge 2 ]] || { tail -6 "$LOG_A" "$LOG_B" >&2; die "expected 2 instances, found $LIVE"; }
+# Count REAL game processes: cmdline mentions the exe but is not the
+# Syringe/wine wrapper (whose cmdline also contains 'gamemd-spawn.exe').
+count_games() {
+    local n=0 f
+    for f in /proc/[0-9]*/cmdline; do
+        if grep -qa 'gamemd-spawn' "$f" 2>/dev/null && ! grep -qia 'syringe' "$f" 2>/dev/null; then
+            n=$((n+1))
+        fi
+    done
+    echo "$n"
+}
+LIVE=$(count_games)
+[[ "$LIVE" -ge 2 ]] || { tail -n 6 "$LOG_A" "$LOG_B" >&2; die "expected 2 game processes, found $LIVE"; }
 echo "both instances up."
 
 wait "$SAMPLER" 2>/dev/null || echo "warning: sampler exited nonzero (see $LOG_A)"
 
+# If the game died during/after sampling (e.g. a load crash), don't sit idle
+# for the rest of DURATION — report what we have.
+if [[ "$(count_games)" -lt 1 ]]; then
+    echo "WARNING: no game processes remain after sampling — likely a load/runtime crash."
+    echo "  check $LOG_A and the game's debug/ folder (snapshot-*/except.txt)."
+fi
+
 # --- let the rest of the duration play out ----------------------------------
 ELAPSED=$(( $(date +%s) - T0 ))
 REMAIN=$(( DURATION - ELAPSED ))
-[[ $REMAIN -gt 0 ]] && sleep "$REMAIN"
+[[ $REMAIN -gt 0 && "$(count_games)" -ge 1 ]] && sleep "$REMAIN"
 T1=$(date +%s)
 cleanup
 trap - EXIT
