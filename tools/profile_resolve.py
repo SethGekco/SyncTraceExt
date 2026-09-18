@@ -72,12 +72,23 @@ def load_maps(path):
 def attribute(ip, sym_addrs, sym_names, regions):
     if GAMEMD_BASE <= ip < GAMEMD_END:
         i = bisect.bisect_right(sym_addrs, ip) - 1
-        if i >= 0 and ip - sym_addrs[i] < 0x4000:
+        off = ip - sym_addrs[i] if i >= 0 else 1 << 30
+        # The Antares PDB map is PARTIAL: a large offset means the real
+        # (unnamed) function is elsewhere and this name is just the nearest
+        # preceding label -- do NOT trust it. Only small offsets are real hits.
+        if off < 0x400:
             return f"gamemd!{sym_names[i]}", "gamemd"
-        return f"gamemd+{(ip & ~0x3F):#x}", "gamemd"
+        if off < 0x1000:
+            return f"gamemd!{sym_names[i]}(approx+{off:#x})", "gamemd"
+        return f"gamemd+{(ip & ~0x3F):#x} (unnamed)", "gamemd"
     lo = bisect.bisect_right([r[0] for r in regions], ip) - 1
     if 0 <= lo < len(regions) and regions[lo][0] <= ip < regions[lo][1]:
-        return regions[lo][2], regions[lo][2]
+        base, name = regions[lo][0], regions[lo][2]
+        if name == "<anon>":
+            # anonymous executable memory: wine JIT / mapped system libs, or
+            # small allocations like Syringe hook trampolines
+            return f"<anon {base:#x}>", "<anon>"
+        return name, name
     return f"?{ip:#x}", "?"
 
 
