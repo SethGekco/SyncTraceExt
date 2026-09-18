@@ -24,6 +24,7 @@
     <ClCompile Include="src\SyncTraceExt.cpp" />
     <ClCompile Include="src\Phobos.cpp" />
     <ClCompile Include="src\SyncTrace.cpp" />
+    <ClCompile Include="src\RenderProbe.cpp" />
     <ClCompile Include="YRpp\StaticInits.cpp" />
     <!-- Phobos utility implementations -->
     <ClCompile Include="Phobos\src\Utilities\Debug.cpp" />
